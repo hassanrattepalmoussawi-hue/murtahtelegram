@@ -1,0 +1,12 @@
+name = "murtah-telegram-bot"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+[vars]
+FIREBASE_PROJECT_ID = "murtah2026"
+FIREBASE_CLIENT_EMAIL = "firebase-adminsdk-fbsvc@murtah2026.iam.gserviceaccount.com"
+
+# الأسرار (TELEGRAM_BOT_TOKEN و FIREBASE_PRIVATE_KEY) تنضاف عبر:
+# wrangler secret put TELEGRAM_BOT_TOKEN
+# wrangler secret put FIREBASE_PRIVATE_KEY
+# مو هنا بالملف — عشان ما تنكشف لو ترفع الملف لـ Git
