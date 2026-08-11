@@ -131,15 +131,6 @@ function fsParse(fields: Record<string, any> = {}): Record<string, any> {
   return out;
 }
 
-async function getDoc(projectId: string, token: string, path: string) {
-  const res = await fetch(`${FIRESTORE_ROOT(projectId)}/${path}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  if (res.status === 404) return null;
-  const data = (await res.json()) as any;
-  return fsParse(data.fields);
-}
-
 async function patchDoc(
   projectId: string,
   token: string,
@@ -153,13 +144,6 @@ async function patchDoc(
     body: JSON.stringify({
       fields: Object.fromEntries(Object.entries(fields).map(([k, v]) => [k, fsValue(v)])),
     }),
-  });
-}
-
-async function deleteDoc(projectId: string, token: string, path: string) {
-  await fetch(`${FIRESTORE_ROOT(projectId)}/${path}`, {
-    method: 'DELETE',
-    headers: { Authorization: `Bearer ${token}` },
   });
 }
 
@@ -187,40 +171,74 @@ async function findUidByPhone(projectId: string, token: string, phone: string): 
   return doc.name.split('/').pop() ?? null;
 }
 
+/// يدور على طلب تحقق pending يطابق نفس الكود المرسل من تيلجرام (بأي كولكشن phone_verifications)
+async function findPendingByCode(
+  projectId: string,
+  token: string,
+  code: string
+): Promise<{ phone: string; fields: Record<string, any> } | null> {
+  const res = await fetch(`${FIRESTORE_ROOT(projectId)}:runQuery`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      structuredQuery: {
+        from: [{ collectionId: 'phone_verifications' }],
+        where: {
+          compositeFilter: {
+            op: 'AND',
+            filters: [
+              {
+                fieldFilter: {
+                  field: { fieldPath: 'code' },
+                  op: 'EQUAL',
+                  value: { stringValue: code },
+                },
+              },
+              {
+                fieldFilter: {
+                  field: { fieldPath: 'status' },
+                  op: 'EQUAL',
+                  value: { stringValue: 'pending' },
+                },
+              },
+            ],
+          },
+        },
+        limit: 1,
+      },
+    }),
+  });
+  const rows = (await res.json()) as Array<{ document?: { name: string; fields: any } }>;
+  const doc = rows.find((r) => r.document)?.document;
+  if (!doc) return null;
+  const phone = doc.name.split('/').pop() ?? '';
+  return { phone, fields: fsParse(doc.fields) };
+}
+
 // ============ Telegram helper ============
 
-async function sendTelegramMessage(
-  env: Env,
-  chatId: number,
-  text: string,
-  replyMarkup?: Record<string, unknown>
-) {
+async function sendTelegramMessage(env: Env, chatId: number, text: string) {
   await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: chatId, text, reply_markup: replyMarkup }),
+    body: JSON.stringify({ chat_id: chatId, text }),
   });
 }
 
 // ============ منطق التحقق الأساسي ============
 
-async function verifyAndMatch(
-  sa: ServiceAccount,
-  token: string,
-  phone: string,
-  code: string
-): Promise<boolean> {
-  const data = await getDoc(sa.project_id, token, `phone_verifications/${phone}`);
-  if (!data) return false;
-  if (data.status !== 'pending') return false;
-  if (data.code !== code) return false;
+async function verifyByCode(sa: ServiceAccount, token: string, code: string): Promise<boolean> {
+  const found = await findPendingByCode(sa.project_id, token, code);
+  if (!found) return false;
 
-  if (data.expiresAt instanceof Date && new Date() > data.expiresAt) {
+  const { phone, fields } = found;
+
+  if (fields.expiresAt instanceof Date && new Date() > fields.expiresAt) {
     await patchDoc(sa.project_id, token, `phone_verifications/${phone}`, { status: 'expired' });
     return false;
   }
 
-  let uid = await findUidByPhone(sa.project_id, token, data.phone as string);
+  let uid = await findUidByPhone(sa.project_id, token, fields.phone as string);
   if (!uid) uid = crypto.randomUUID();
 
   const customToken = await mintCustomToken(sa, uid);
@@ -254,53 +272,29 @@ export default {
     try {
       const update = (await request.json()) as any;
       const message = update.message;
-      if (!message) return new Response('OK');
+      if (!message || typeof message.text !== 'string') return new Response('OK');
 
       const chatId: number = message.chat.id;
+      const text: string = message.text.trim();
+
+      // نتجاهل /start (ترحيبي بس)، ونعالج أي رسالة نصية باقية كأنها كود محتمل
+      if (text.startsWith('/start')) {
+        await sendTelegramMessage(env, chatId, 'أرسل رمز التوثيق المكوّن من 6 أرقام الظاهر بالتطبيق.');
+        return new Response('OK');
+      }
+
+      if (!/^\d{6}$/.test(text)) {
+        return new Response('OK');
+      }
+
       const accessToken = await getAccessToken(sa);
+      const success = await verifyByCode(sa, accessToken, text);
 
-      // الحالة 1: /start يحتوي الكود
-      if (typeof message.text === 'string' && message.text.startsWith('/start')) {
-        const code = message.text.split(' ')[1];
-
-        if (code && /^\d{6}$/.test(code)) {
-          await patchDoc(sa.project_id, accessToken, `telegram_sessions/${chatId}`, { code });
-          await sendTelegramMessage(
-            env,
-            chatId,
-            'لإتمام التوثيق، شارك رقم هاتفك بالضغط على الزر بالأسفل 👇',
-            {
-              keyboard: [[{ text: '📱 مشاركة رقم الهاتف', request_contact: true }]],
-              resize_keyboard: true,
-              one_time_keyboard: true,
-            }
-          );
-        } else {
-          await sendTelegramMessage(env, chatId, 'رابط التوثيق غير صالح، الرجاء إعادة المحاولة من التطبيق.');
-        }
-        return new Response('OK');
-      }
-
-      // الحالة 2: مشاركة رقم الهاتف
-      if (message.contact) {
-        const session = await getDoc(sa.project_id, accessToken, `telegram_sessions/${chatId}`);
-        if (!session) {
-          await sendTelegramMessage(env, chatId, 'انتهت الجلسة، الرجاء البدء من جديد من التطبيق.');
-          return new Response('OK');
-        }
-
-        const phone = String(message.contact.phone_number).replace('+', '').trim();
-        const success = await verifyAndMatch(sa, accessToken, phone, session.code as string);
-
-        await sendTelegramMessage(
-          env,
-          chatId,
-          success ? '✅ تم التوثيق بنجاح، ارجع للتطبيق.' : '❌ الكود غير صحيح أو منتهي، حاول من جديد.'
-        );
-
-        await deleteDoc(sa.project_id, accessToken, `telegram_sessions/${chatId}`);
-        return new Response('OK');
-      }
+      await sendTelegramMessage(
+        env,
+        chatId,
+        success ? '✅ تم التوثيق بنجاح، ارجع للتطبيق.' : '❌ الكود غير صحيح أو منتهي، حاول من جديد.'
+      );
 
       return new Response('OK');
     } catch (err) {
