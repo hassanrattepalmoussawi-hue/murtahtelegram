@@ -1,8 +1,12 @@
 export interface Env {
   TELEGRAM_BOT_TOKEN: string;
-  FIREBASE_PROJECT_ID: string;
-  FIREBASE_CLIENT_EMAIL: string;
-  FIREBASE_PRIVATE_KEY: string; // PEM كامل، بالأسرار (secret) مو بالمتغيرات العادية
+  FIREBASE_SERVICE_ACCOUNT: string; // ملف الـ JSON كامل، بالأسرار (secret)
+}
+
+interface ServiceAccount {
+  project_id: string;
+  client_email: string;
+  private_key: string;
 }
 
 const FIRESTORE_ROOT = (projectId: string) =>
@@ -50,14 +54,23 @@ async function signJwt(payload: Record<string, unknown>, privateKey: CryptoKey):
   return `${signingInput}.${base64url(signature)}`;
 }
 
+function parseServiceAccount(env: Env): ServiceAccount {
+  const raw = (env.FIREBASE_SERVICE_ACCOUNT || '').replace(/^\uFEFF/, '').trim();
+  const sa = JSON.parse(raw) as ServiceAccount;
+  if (!sa.private_key || !sa.client_email || !sa.project_id) {
+    throw new Error('FIREBASE_SERVICE_ACCOUNT ناقص حقول أساسية (private_key/client_email/project_id)');
+  }
+  return sa;
+}
+
 /// توكن وصول مؤقت (ساعة وحدة) للتعامل مع Firestore REST API
-async function getAccessToken(env: Env): Promise<string> {
-  const privateKey = await importPrivateKey(env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'));
+async function getAccessToken(sa: ServiceAccount): Promise<string> {
+  const privateKey = await importPrivateKey(sa.private_key);
   const now = Math.floor(Date.now() / 1000);
 
   const jwt = await signJwt(
     {
-      iss: env.FIREBASE_CLIENT_EMAIL,
+      iss: sa.client_email,
       scope: 'https://www.googleapis.com/auth/datastore',
       aud: 'https://oauth2.googleapis.com/token',
       iat: now,
@@ -78,14 +91,14 @@ async function getAccessToken(env: Env): Promise<string> {
 }
 
 /// Custom Token لتسجيل الدخول بالتطبيق — موقّع محليًا، بدون أي طلب شبكة
-async function mintCustomToken(env: Env, uid: string): Promise<string> {
-  const privateKey = await importPrivateKey(env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'));
+async function mintCustomToken(sa: ServiceAccount, uid: string): Promise<string> {
+  const privateKey = await importPrivateKey(sa.private_key);
   const now = Math.floor(Date.now() / 1000);
 
   return signJwt(
     {
-      iss: env.FIREBASE_CLIENT_EMAIL,
-      sub: env.FIREBASE_CLIENT_EMAIL,
+      iss: sa.client_email,
+      sub: sa.client_email,
       aud: 'https://identitytoolkit.googleapis.com/google.identity.identitytoolkit.v1.IdentityToolkit',
       iat: now,
       exp: now + 3600,
@@ -118,8 +131,8 @@ function fsParse(fields: Record<string, any> = {}): Record<string, any> {
   return out;
 }
 
-async function getDoc(env: Env, token: string, path: string) {
-  const res = await fetch(`${FIRESTORE_ROOT(env.FIREBASE_PROJECT_ID)}/${path}`, {
+async function getDoc(projectId: string, token: string, path: string) {
+  const res = await fetch(`${FIRESTORE_ROOT(projectId)}/${path}`, {
     headers: { Authorization: `Bearer ${token}` },
   });
   if (res.status === 404) return null;
@@ -128,13 +141,13 @@ async function getDoc(env: Env, token: string, path: string) {
 }
 
 async function patchDoc(
-  env: Env,
+  projectId: string,
   token: string,
   path: string,
   fields: Record<string, unknown>
 ) {
   const updateMask = Object.keys(fields).map((k) => `updateMask.fieldPaths=${k}`).join('&');
-  await fetch(`${FIRESTORE_ROOT(env.FIREBASE_PROJECT_ID)}/${path}?${updateMask}`, {
+  await fetch(`${FIRESTORE_ROOT(projectId)}/${path}?${updateMask}`, {
     method: 'PATCH',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -143,15 +156,15 @@ async function patchDoc(
   });
 }
 
-async function deleteDoc(env: Env, token: string, path: string) {
-  await fetch(`${FIRESTORE_ROOT(env.FIREBASE_PROJECT_ID)}/${path}`, {
+async function deleteDoc(projectId: string, token: string, path: string) {
+  await fetch(`${FIRESTORE_ROOT(projectId)}/${path}`, {
     method: 'DELETE',
     headers: { Authorization: `Bearer ${token}` },
   });
 }
 
-async function findUidByPhone(env: Env, token: string, phone: string): Promise<string | null> {
-  const res = await fetch(`${FIRESTORE_ROOT(env.FIREBASE_PROJECT_ID)}:runQuery`, {
+async function findUidByPhone(projectId: string, token: string, phone: string): Promise<string | null> {
+  const res = await fetch(`${FIRESTORE_ROOT(projectId)}:runQuery`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -191,23 +204,28 @@ async function sendTelegramMessage(
 
 // ============ منطق التحقق الأساسي ============
 
-async function verifyAndMatch(env: Env, token: string, phone: string, code: string): Promise<boolean> {
-  const data = await getDoc(env, token, `phone_verifications/${phone}`);
+async function verifyAndMatch(
+  sa: ServiceAccount,
+  token: string,
+  phone: string,
+  code: string
+): Promise<boolean> {
+  const data = await getDoc(sa.project_id, token, `phone_verifications/${phone}`);
   if (!data) return false;
   if (data.status !== 'pending') return false;
   if (data.code !== code) return false;
 
   if (data.expiresAt instanceof Date && new Date() > data.expiresAt) {
-    await patchDoc(env, token, `phone_verifications/${phone}`, { status: 'expired' });
+    await patchDoc(sa.project_id, token, `phone_verifications/${phone}`, { status: 'expired' });
     return false;
   }
 
-  let uid = await findUidByPhone(env, token, data.phone as string);
+  let uid = await findUidByPhone(sa.project_id, token, data.phone as string);
   if (!uid) uid = crypto.randomUUID();
 
-  const customToken = await mintCustomToken(env, uid);
+  const customToken = await mintCustomToken(sa, uid);
 
-  await patchDoc(env, token, `phone_verifications/${phone}`, {
+  await patchDoc(sa.project_id, token, `phone_verifications/${phone}`, {
     status: 'verified',
     uid,
     customToken,
@@ -225,20 +243,28 @@ export default {
       return new Response('OK');
     }
 
+    let sa: ServiceAccount;
+    try {
+      sa = parseServiceAccount(env);
+    } catch (err) {
+      console.error('Telegram webhook error: bad service account —', err instanceof Error ? err.message : String(err));
+      return new Response('OK');
+    }
+
     try {
       const update = (await request.json()) as any;
       const message = update.message;
       if (!message) return new Response('OK');
 
       const chatId: number = message.chat.id;
-      const accessToken = await getAccessToken(env);
+      const accessToken = await getAccessToken(sa);
 
       // الحالة 1: /start يحتوي الكود
       if (typeof message.text === 'string' && message.text.startsWith('/start')) {
         const code = message.text.split(' ')[1];
 
         if (code && /^\d{6}$/.test(code)) {
-          await patchDoc(env, accessToken, `telegram_sessions/${chatId}`, { code });
+          await patchDoc(sa.project_id, accessToken, `telegram_sessions/${chatId}`, { code });
           await sendTelegramMessage(
             env,
             chatId,
@@ -257,14 +283,14 @@ export default {
 
       // الحالة 2: مشاركة رقم الهاتف
       if (message.contact) {
-        const session = await getDoc(env, accessToken, `telegram_sessions/${chatId}`);
+        const session = await getDoc(sa.project_id, accessToken, `telegram_sessions/${chatId}`);
         if (!session) {
           await sendTelegramMessage(env, chatId, 'انتهت الجلسة، الرجاء البدء من جديد من التطبيق.');
           return new Response('OK');
         }
 
         const phone = String(message.contact.phone_number).replace('+', '').trim();
-        const success = await verifyAndMatch(env, accessToken, phone, session.code as string);
+        const success = await verifyAndMatch(sa, accessToken, phone, session.code as string);
 
         await sendTelegramMessage(
           env,
@@ -272,12 +298,12 @@ export default {
           success ? '✅ تم التوثيق بنجاح، ارجع للتطبيق.' : '❌ الكود غير صحيح أو منتهي، حاول من جديد.'
         );
 
-        await deleteDoc(env, accessToken, `telegram_sessions/${chatId}`);
+        await deleteDoc(sa.project_id, accessToken, `telegram_sessions/${chatId}`);
         return new Response('OK');
       }
 
       return new Response('OK');
-  } catch (err) {
+    } catch (err) {
       console.error('Telegram webhook error:', err instanceof Error ? err.message : String(err));
       return new Response('OK'); // دايمًا 200 حتى لو صار خطأ، وإلا تيلجرام يعيد المحاولة بإزعاج
     }
