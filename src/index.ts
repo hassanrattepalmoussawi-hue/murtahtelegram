@@ -277,19 +277,25 @@ export default {
       const chatId: number = message.chat.id;
       const text: string = message.text.trim();
 
-      // نتجاهل /start (ترحيبي بس)، ونعالج أي رسالة نصية باقية كأنها كود محتمل
-      if (text.startsWith('/start')) {
-        await sendTelegramMessage(env, chatId, 'أرسل رمز التوثيق المكوّن من 6 أرقام الظاهر بالتطبيق.');
-        return new Response('OK');
-      }
+      // /start يجي مع الكود كـ parameter (رابط ?start=CODE يحوله تيلجرام تلقائياً لهذا الشكل)
+      let code: string | null = null;
 
-      if (!/^\d{6}$/.test(text)) {
+      if (text.startsWith('/start')) {
+        const param = text.split(' ')[1];
+        if (param && /^\d{6}$/.test(param)) {
+          code = param;
+        } else {
+          await sendTelegramMessage(env, chatId, 'أرسل رمز التوثيق المكوّن من 6 أرقام الظاهر بالتطبيق.');
+          return new Response('OK');
+        }
+      } else if (/^\d{6}$/.test(text)) {
+        code = text; // مسار احتياطي: كتابة الكود يدوياً
+      } else {
         return new Response('OK');
       }
 
       const accessToken = await getAccessToken(sa);
-      const success = await verifyByCode(sa, accessToken, text);
-
+      const success = await verifyByCode(sa, accessToken, code);
       await sendTelegramMessage(
         env,
         chatId,
