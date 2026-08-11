@@ -277,8 +277,8 @@ export default {
       }
 
       return new Response('OK');
-    } catch (err) {
-      console.error('Telegram webhook error:', err);
+  } catch (err) {
+      console.error('Telegram webhook error:', err instanceof Error ? err.message : String(err));
       return new Response('OK'); // دايمًا 200 حتى لو صار خطأ، وإلا تيلجرام يعيد المحاولة بإزعاج
     }
   },
