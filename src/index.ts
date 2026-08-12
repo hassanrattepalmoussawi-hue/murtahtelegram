@@ -131,6 +131,15 @@ function fsParse(fields: Record<string, any> = {}): Record<string, any> {
   return out;
 }
 
+async function getDoc(projectId: string, token: string, path: string) {
+  const res = await fetch(`${FIRESTORE_ROOT(projectId)}/${path}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (res.status === 404) return null;
+  const data = (await res.json()) as any;
+  return fsParse(data.fields);
+}
+
 async function patchDoc(
   projectId: string,
   token: string,
@@ -144,6 +153,13 @@ async function patchDoc(
     body: JSON.stringify({
       fields: Object.fromEntries(Object.entries(fields).map(([k, v]) => [k, fsValue(v)])),
     }),
+  });
+}
+
+async function deleteDoc(projectId: string, token: string, path: string) {
+  await fetch(`${FIRESTORE_ROOT(projectId)}/${path}`, {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${token}` },
   });
 }
 
@@ -171,7 +187,7 @@ async function findUidByPhone(projectId: string, token: string, phone: string): 
   return doc.name.split('/').pop() ?? null;
 }
 
-/// يدور على طلب تحقق pending يطابق نفس الكود المرسل من تيلجرام (بأي كولكشن phone_verifications)
+/// يدور على طلب تحقق pending يطابق نفس الكود، ويرجّع رقم الهاتف المطلوب توثيقه
 async function findPendingByCode(
   projectId: string,
   token: string,
@@ -217,38 +233,76 @@ async function findPendingByCode(
 
 // ============ Telegram helper ============
 
-async function sendTelegramMessage(env: Env, chatId: number, text: string) {
+async function sendTelegramMessage(
+  env: Env,
+  chatId: number,
+  text: string,
+  replyMarkup?: Record<string, unknown>
+) {
   await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: chatId, text }),
+    body: JSON.stringify({ chat_id: chatId, text, reply_markup: replyMarkup }),
   });
 }
 
 // ============ منطق التحقق الأساسي ============
 
-async function verifyByCode(sa: ServiceAccount, token: string, code: string): Promise<boolean> {
+// المرحلة 1: يجي /start CODE — نتأكد إن الكود صالح ونربطه بمحادثة تيلجرام (chatId) عشان لما يضغط الزر نعرف أي كود نطابق
+async function startVerification(
+  sa: ServiceAccount,
+  token: string,
+  chatId: number,
+  code: string
+): Promise<'ok' | 'invalid'> {
   const found = await findPendingByCode(sa.project_id, token, code);
-  if (!found) return false;
+  if (!found) return 'invalid';
 
-  const { phone, fields } = found;
+  if (found.fields.expiresAt instanceof Date && new Date() > found.fields.expiresAt) {
+    await patchDoc(sa.project_id, token, `phone_verifications/${found.phone}`, { status: 'expired' });
+    return 'invalid';
+  }
 
-  if (fields.expiresAt instanceof Date && new Date() > fields.expiresAt) {
-    await patchDoc(sa.project_id, token, `phone_verifications/${phone}`, { status: 'expired' });
+  // نربط هذا الكود بالمحادثة الحالية، حتى لو تجي مشاركة الرقم نعرف نطابقها بدون ما نطلب من المستخدم يكتب أي شي
+  await patchDoc(sa.project_id, token, `telegram_sessions/${chatId}`, {
+    code,
+    expectedPhone: found.phone,
+  });
+
+  return 'ok';
+}
+
+// المرحلة 2: يجي message.contact (بعد ضغطة زر وحدة) — نطابق رقم الهاتف الحقيقي المؤكد من تيلجرام مع الرقم المطلوب توثيقه
+async function completeVerificationByContact(
+  sa: ServiceAccount,
+  token: string,
+  chatId: number,
+  sharedPhone: string
+): Promise<boolean> {
+  const session = await getDoc(sa.project_id, token, `telegram_sessions/${chatId}`);
+  if (!session) return false;
+
+  const expectedPhone = String(session.expectedPhone);
+  const normalizedShared = sharedPhone.replace('+', '').trim();
+
+  // لازم رقم الهاتف اللي جاء من تيلجرام (مؤكد من تيلجرام نفسه) يطابق تماماً الرقم اللي طلب التطبيق توثيقه
+  if (normalizedShared !== expectedPhone) {
+    await deleteDoc(sa.project_id, token, `telegram_sessions/${chatId}`);
     return false;
   }
 
-  let uid = await findUidByPhone(sa.project_id, token, fields.phone as string);
+  let uid = await findUidByPhone(sa.project_id, token, expectedPhone);
   if (!uid) uid = crypto.randomUUID();
 
   const customToken = await mintCustomToken(sa, uid);
 
-  await patchDoc(sa.project_id, token, `phone_verifications/${phone}`, {
+  await patchDoc(sa.project_id, token, `phone_verifications/${expectedPhone}`, {
     status: 'verified',
     uid,
     customToken,
   });
 
+  await deleteDoc(sa.project_id, token, `telegram_sessions/${chatId}`);
   return true;
 }
 
@@ -272,35 +326,52 @@ export default {
     try {
       const update = (await request.json()) as any;
       const message = update.message;
-      if (!message || typeof message.text !== 'string') return new Response('OK');
+      if (!message) return new Response('OK');
 
       const chatId: number = message.chat.id;
-      const text: string = message.text.trim();
+      const accessToken = await getAccessToken(sa);
 
-      // /start يجي مع الكود كـ parameter (رابط ?start=CODE يحوله تيلجرام تلقائياً لهذا الشكل)
-      let code: string | null = null;
+      // الحالة 1: /start CODE — يجي تلقائياً من الرابط، بدون أي إدخال من المستخدم
+      if (typeof message.text === 'string' && message.text.startsWith('/start')) {
+        const code = message.text.split(' ')[1];
 
-      if (text.startsWith('/start')) {
-        const param = text.split(' ')[1];
-        if (param && /^\d{6}$/.test(param)) {
-          code = param;
+        if (code && /^\d{6}$/.test(code)) {
+          const result = await startVerification(sa, accessToken, chatId, code);
+
+          if (result === 'ok') {
+            await sendTelegramMessage(
+              env,
+              chatId,
+              'اضغط الزر بالأسفل لتأكيد حسابك 👇',
+              {
+                keyboard: [[{ text: '📱 تأكيد الحساب', request_contact: true }]],
+                resize_keyboard: true,
+                one_time_keyboard: true,
+              }
+            );
+          } else {
+            await sendTelegramMessage(env, chatId, 'رابط التوثيق منتهي أو غير صالح، الرجاء إعادة المحاولة من التطبيق.');
+          }
         } else {
-          await sendTelegramMessage(env, chatId, 'أرسل رمز التوثيق المكوّن من 6 أرقام الظاهر بالتطبيق.');
-          return new Response('OK');
+          await sendTelegramMessage(env, chatId, 'الرجاء فتح رابط التوثيق من التطبيق مباشرة.');
         }
-      } else if (/^\d{6}$/.test(text)) {
-        code = text; // مسار احتياطي: كتابة الكود يدوياً
-      } else {
         return new Response('OK');
       }
 
-      const accessToken = await getAccessToken(sa);
-      const success = await verifyByCode(sa, accessToken, code);
-      await sendTelegramMessage(
-        env,
-        chatId,
-        success ? '✅ تم التوثيق بنجاح، ارجع للتطبيق.' : '❌ الكود غير صحيح أو منتهي، حاول من جديد.'
-      );
+      // الحالة 2: ضغطة زر "تأكيد الحساب" — تيلجرام يرسل رقم الهاتف الحقيقي تلقائياً، بدون أي كتابة
+      if (message.contact) {
+        const sharedPhone = String(message.contact.phone_number);
+        const success = await completeVerificationByContact(sa, accessToken, chatId, sharedPhone);
+
+        await sendTelegramMessage(
+          env,
+          chatId,
+          success
+            ? '✅ تم التوثيق بنجاح، ارجع للتطبيق.'
+            : '❌ رقم هاتف حسابك بتيلجرام لا يطابق الرقم المطلوب توثيقه، أو انتهت الجلسة.'
+        );
+        return new Response('OK');
+      }
 
       return new Response('OK');
     } catch (err) {
