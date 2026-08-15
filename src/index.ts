@@ -291,7 +291,7 @@ async function completeVerificationByContact(
     return false;
   }
 
-  let uid = await findUidByPhone(sa.project_id, token, expectedPhone);
+  let uid = await findUidByPhone(sa.project_id, token, `+${expectedPhone}`);
   if (!uid) uid = crypto.randomUUID();
 
   const customToken = await mintCustomToken(sa, uid);
